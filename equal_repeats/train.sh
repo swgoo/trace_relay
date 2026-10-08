@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Paper protocol: paper/table/protocol.tex and paper/data/equal_repeats.json.
+# Default: the complete sequential sweep. DRY_RUN=1 prints commands only.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+PYTHON="${PYTHON:-.venv/bin/python}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/paper-reproduction/equal-repeats}"
+read -r -a centers <<< "${CENTERS:-${CENTER_WIDTH:-64 32 16}}"
+read -r -a seeds <<< "${SEEDS:-${SEED:-42 43 44}}"
+read -r -a models <<< "${MODELS:-${MODEL_FAMILY:-trace_relay no_carry}}"
+sweep_options=(--execute)
+if [[ "${DRY_RUN:-0}" == 1 ]]; then
+  sweep_options=()
+fi
+tracking=(--wandb-mode "${WANDB_MODE:-online}" --wandb-project "${WANDB_PROJECT:-TraceRelayEqualRepeats}")
+if [[ -n "${WANDB_ENTITY:-}" ]]; then
+  tracking+=(--wandb-entity "$WANDB_ENTITY")
+fi
+
+exec "$PYTHON" -u -m equal_repeats.sweep \
+  --python "$PYTHON" --output-root "$OUTPUT_ROOT" --device "${DEVICE:-cuda}" \
+  --centers "${centers[@]}" --seeds "${seeds[@]}" --models "${models[@]}" \
+  --early-stop-accuracy "${EARLY_STOP_ACCURACY:-0.99}" --early-stop-passes "${EARLY_STOP_PASSES:-2}" \
+  "${sweep_options[@]}" -- \
+  --precision "${PRECISION:-bf16}" --attn-implementation "${ATTN_IMPLEMENTATION:-flash_attention_2}" \
+  --hidden-size 64 --intermediate-size 256 --heads 4 \
+  --left-windows 15 15 15 --right-windows 7 7 7 --relay-strides 8 8 8 --skip-pairs \
+  --steps "${STEPS:-20000}" --batch-size 64 \
+  --train-min-length 32 --train-max-length 256 \
+  --validation-lengths 32 64 128 256 --validation-examples 1024 --validation-seed 20261007 \
+  --eval-lengths 32 64 128 256 512 1024 2048 4096 --eval-examples 10000 --eval-seed 20261006 \
+  --eval-batch-size 128 --eval-chunk-size 0 --eval-every 250 --log-every 50 \
+  --learning-rate 3e-4 --warmup-steps 100 --weight-decay 0.01 --grad-clip 1.0 --threads 1 \
+  "${tracking[@]}" "$@"
