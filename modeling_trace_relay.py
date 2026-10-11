@@ -43,7 +43,7 @@ def phase_stride_scan(increments, stride, initial=None):
     if initial is None:
         initial = increments.new_zeros(batch, stride, width, dtype=torch.float32)
     if initial.shape != (batch, stride, width):
-        raise ValueError("initial must have shape (batch, stride, trace_width)")
+        raise ValueError("initial must have shape (batch, stride, hidden_size)")
     # FP64 preserves low-order phase bits in long scans; MPS has no FP64.
     accumulation_dtype = torch.float32 if increments.device.type == "mps" else torch.float64
     pad = (-length) % stride
@@ -92,15 +92,15 @@ class RMSNorm(nn.Module):
 class LocalAttention(nn.Module):
     """Local eager attention or native FlashAttention-2 sliding windows."""
 
-    def __init__(self, query_width, hidden_size, width, heads, left, right, dropout, config=None):
+    def __init__(self, hidden_size, heads, left, right, dropout, config=None):
         super().__init__()
         self.config = config
-        self.heads, self.head_dim = heads, width // heads
+        self.heads, self.head_dim = heads, hidden_size // heads
         self.left, self.right, self.dropout = left, right, dropout
-        self.q_proj = nn.Linear(query_width, width, bias=False)
-        self.k_proj = nn.Linear(hidden_size, width, bias=False)
-        self.v_proj = nn.Linear(hidden_size, width, bias=False)
-        self.o_proj = nn.Linear(width, width, bias=False)
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.position_encoding = "relative_bias" if config is None else config.position_encoding
         self.rope_theta = 10_000.0 if config is None else config.rope_theta
         if self.position_encoding == "relative_bias":
@@ -257,9 +257,11 @@ class TraceRelayCache(Cache):
     @staticmethod
     def config_signature(config):
         return (config.layer_order, config.hidden_size, config.num_attention_heads, config.position_encoding, config.rope_theta,
+                tuple(config.layer_hidden_sizes), tuple(config.layer_intermediate_sizes),
+                tuple(config.layer_num_attention_heads),
                 tuple(tuple(pair) for pair in config.skip_pairs), config.recurrent_carry, config.relay_enabled,
                 *(tuple(getattr(config, name)) for name in (
-            "trace_width", "left_window", "right_window", "relay_stride"
+            "left_window", "right_window", "relay_stride"
         )))
 
     @property
@@ -314,7 +316,8 @@ class TraceRelayCache(Cache):
 class TraceRelayLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        h, width = config.hidden_size, config.trace_width[layer_idx]
+        h = config.layer_hidden_sizes[layer_idx]
+        heads = config.layer_num_attention_heads[layer_idx]
         self.relay_enabled = config.relay_enabled
         self.recurrent_carry = config.recurrent_carry
         self.stride = config.relay_stride[layer_idx]
@@ -324,22 +327,23 @@ class TraceRelayLayer(nn.Module):
             self.input_norm = RMSNorm(h, config.rms_norm_eps)
         self.left_input_norm = RMSNorm(h, config.rms_norm_eps)
         self.left_attention = LocalAttention(
-            h, h, width, config.num_attention_heads,
+            h, heads,
             config.left_window[layer_idx], 0, config.attention_dropout, config=config,
         )
         if self.relay_enabled:
             self.right_attention = LocalAttention(
-                h, h, width, config.num_attention_heads,
+                h, heads,
                 0, config.right_window[layer_idx], config.attention_dropout, config=config,
             )
-            self.right_phase = nn.Linear(width, width, bias=False)
-        self.left_output = nn.Linear(width, h, bias=False)
+            self.right_phase = nn.Linear(h, h, bias=False)
+        self.left_output = nn.Linear(h, h, bias=False)
         if self.relay_enabled:
-            self.phase_output = nn.Linear(2 * width, h, bias=False)
+            self.phase_output = nn.Linear(2 * h, h, bias=False)
         self.post_norm = RMSNorm(h, config.rms_norm_eps)
-        self.gate_proj = nn.Linear(h, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(h, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, h, bias=False)
+        ff = config.layer_intermediate_sizes[layer_idx]
+        self.gate_proj = nn.Linear(h, ff, bias=False)
+        self.up_proj = nn.Linear(h, ff, bias=False)
+        self.down_proj = nn.Linear(ff, h, bias=False)
         self.dropout = nn.Dropout(config.hidden_dropout)
 
     def forward(self, hidden, mask, offset, state=None):
@@ -429,7 +433,7 @@ class TraceRelayLayer(nn.Module):
             hidden[:, :0].clone(),
             left_source[:, start:].clone(),
             source_mask[:, start:].clone(),
-            hidden.new_empty(hidden.shape[0], 0, self.left_attention.heads * self.left_attention.head_dim,
+            hidden.new_empty(hidden.shape[0], 0, hidden.shape[-1],
                              dtype=torch.float32),
             mask[:, :0].clone(),
         )
@@ -459,8 +463,8 @@ class TraceRelayPreTrainedModel(PreTrainedModel):
             raise ValueError("TraceRelay supports attn_implementation='eager' or 'flash_attention_2'")
         if self.config.position_encoding != "rope":
             raise ValueError("FlashAttention requires a RoPE checkpoint; relative_bias checkpoints must use eager")
-        if any(width // self.config.num_attention_heads > 256 for width in self.config.trace_width):
-            raise ValueError("FlashAttention-2 requires a per-head trace width <= 256")
+        if any(h // heads > 256 for h, heads in zip(self.config.layer_hidden_sizes, self.config.layer_num_attention_heads)):
+            raise ValueError("FlashAttention-2 requires a per-head hidden dimension <= 256")
         self._flash_attn_can_dispatch(2, is_init_check=is_init_check)
         _load_flash_attention()
         return "flash_attention_2"
@@ -482,10 +486,25 @@ class TraceRelayModel(TraceRelayPreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList([TraceRelayLayer(config, i) for i in range(config.num_hidden_layers)])
+        layer_inputs = [config.hidden_size, *config.layer_hidden_sizes[:-1]]
+        self.layer_input_projections = nn.ModuleList([
+            nn.Identity() if src == dst else nn.Linear(src, dst, bias=False)
+            for src, dst in zip(layer_inputs, config.layer_hidden_sizes)
+        ])
         self.skip_sources = {source for source, _ in config.skip_pairs}
         self.skip_destinations = {}
         for source, destination in config.skip_pairs:
             self.skip_destinations.setdefault(destination, []).append(source)
+        self.skip_projections = nn.ModuleDict({
+            f"{src}_{dst}": (
+                nn.Identity() if config.layer_hidden_sizes[src] == config.layer_hidden_sizes[dst]
+                else nn.Linear(config.layer_hidden_sizes[src], config.layer_hidden_sizes[dst], bias=False)
+            ) for src, dst in config.skip_pairs
+        })
+        self.output_projection = (
+            nn.Identity() if config.layer_hidden_sizes[-1] == config.hidden_size
+            else nn.Linear(config.layer_hidden_sizes[-1], config.hidden_size, bias=False)
+        )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_init()
 
@@ -546,16 +565,18 @@ class TraceRelayModel(TraceRelayPreTrainedModel):
         next_states = []
         skip_outputs = {}
         for index, layer in enumerate(self.layers):
+            hidden = self.layer_input_projections[index](hidden)
             # These tensors all describe this call's identical physical token
             # positions; skips never move information along the time axis.
             for source in self.skip_destinations.get(index, ()):
-                hidden = hidden + skip_outputs[source]
+                hidden = hidden + self.skip_projections[f"{source}_{index}"](skip_outputs[source])
             if output_hidden_states:
                 history += (hidden,)
             hidden, state = layer(hidden, mask, offset, None if cache is None else cache.states[index])
             if index in self.skip_sources:
                 skip_outputs[index] = hidden
             next_states.append(state)
+        hidden = self.output_projection(hidden)
         hidden = self.norm(hidden) * mask[:, :, None]
         if output_hidden_states:
             history += (hidden,)
@@ -567,8 +588,6 @@ class TraceRelayModel(TraceRelayPreTrainedModel):
 
 
 class TraceRelayForCausalLM(TraceRelayPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
-
     def __init__(self, config):
         super().__init__(config)
         self.model = TraceRelayModel(config)

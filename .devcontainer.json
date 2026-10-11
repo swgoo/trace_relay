@@ -1,0 +1,28 @@
+{
+	"image": "docker.io/pytorch/pytorch:2.10.0-cuda13.0-cudnn9-devel",
+	"workspaceFolder": "/root/${localWorkspaceFolderBasename}",
+	"mounts": [
+		"source=${localWorkspaceFolder},target=/root/${localWorkspaceFolderBasename},type=bind"
+	],
+	"features": {
+		"ghcr.io/devcontainers/features/common-utils:2": {
+			"installZsh": "true",
+			"configureZshAsDefaultShell": "true",
+			"installOhMyZsh": "true",
+			"upgradePackages": "false"
+		}
+	},
+	"postCreateCommand": "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended lmodern poppler-utils && pip install --break-system-packages -e '.[test]'",
+	"extensions": [
+		"ms-python.python",
+		"ms-toolsai.jupyter",
+		"ms-python.black-formatter",
+		"ms-python.isort",
+	],
+	"runArgs": [
+		"--device",
+		"nvidia.com/gpu=all",
+		"--net=host"
+	],
+	"containerRuntime": "podman"
+}

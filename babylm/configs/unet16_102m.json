@@ -1,0 +1,23 @@
+{
+  "model_type": "trace_relay",
+  "layer_order": "right_scan_left",
+  "vocab_size": 259,
+  "hidden_sizes": [736, 368, 192, 368, 736],
+  "depths": [3, 3, 4, 3, 3],
+  "stage_num_attention_heads": [8, 8, 8, 8, 8],
+  "mlp_ratios": 4,
+  "left_windows": [16, 32, 64, 128, 256, 512, 1024, 2048, 2048, 1024, 512, 256, 128, 64, 32, 16],
+  "right_windows": [16, 32, 64, 128, 256, 256, 256, 256, 256, 256, 256, 256, 128, 64, 32, 16],
+  "relay_strides": [17, 33, 65, 129, 257, 257, 257, 257, 257, 257, 257, 257, 129, 65, 33, 17],
+  "skip_stage_pairs": [[0, 4], [1, 3]],
+  "recurrent_carry": true,
+  "relay_enabled": true,
+  "attention_dropout": 0.0,
+  "hidden_dropout": 0.0,
+  "position_encoding": "rope",
+  "pad_token_id": 0,
+  "bos_token_id": 1,
+  "eos_token_id": 1,
+  "tie_word_embeddings": false,
+  "use_cache": false
+}
