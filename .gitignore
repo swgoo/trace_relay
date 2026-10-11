@@ -221,4 +221,4 @@ __marimo__/
 outputs/
 
 # Prepared/downloaded ListOps corpora
-/data/listops*/
+data/
