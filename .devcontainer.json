@@ -12,7 +12,9 @@
 			"upgradePackages": "false"
 		}
 	},
-	"postCreateCommand": "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended lmodern poppler-utils && pip install --break-system-packages -e '.[test]'",
+	// Release wheel matches this image's CUDA 13, PyTorch 2.10, Python 3.12 and C++11 ABI.
+	"postCreateCommand": "apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends latexmk texlive-latex-base texlive-latex-recommended texlive-fonts-recommended lmodern poppler-utils && pip install --break-system-packages -e '.[test]' && python -m pip install --break-system-packages --only-binary=:all: 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu13torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl'",
+	"shutdownAction": "stopContainer",
 	"extensions": [
 		"ms-python.python",
 		"ms-toolsai.jupyter",

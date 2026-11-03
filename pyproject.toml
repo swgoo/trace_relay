@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trace-relay"
-version = "0.0.2"
-description = "Minimal Transformers-compatible recurrent memory via delayed Right-attention updates"
+version = "0.3.0"
+description = "Minimal Transformers-compatible recurrent memory via immediate causal write/read attention"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["torch>=2.6", "transformers>=5.14.1,<6"]
@@ -15,15 +15,19 @@ test = ["pytest>=8"]
 flash = ["flash-attn>=2.6.0,<3"]
 tracking = ["wandb>=0.18"]
 babylm = ["numpy>=1.26", "huggingface-hub>=0.30"]
+most-freq = ["matplotlib>=3.8"]
+dyck = ["matplotlib>=3.8"]
+reset-most-freq = ["matplotlib>=3.8"]
+entity-tracking = ["matplotlib>=3.8"]
 
 [tool.setuptools]
-packages = ["trace_relay", "trace_relay.babylm"]
+packages = ["trace_relay", "trace_relay.modular_addition"]
 
 [tool.setuptools.package-dir]
 trace_relay = "."
 
 [tool.setuptools.package-data]
-"trace_relay.babylm" = ["configs/*.json", "*.sh", "README.md"]
+"trace_relay.modular_addition" = ["*.sh", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

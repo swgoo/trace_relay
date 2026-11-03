@@ -1,9 +1,9 @@
-"""TraceRelay: local attention, delayed Right update, and a pure-phase stride scan."""
+"""TraceRelay: causal write/read attention with an immediate recurrent phase scan."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import lru_cache
 from importlib.metadata import version
 
@@ -30,12 +30,11 @@ def wrap_phase(angles):
 def phase_stride_scan(increments, stride, initial=None):
     """Solve theta[t] = wrap(theta[t-stride] + increments[t]).
 
-    In TraceRelay, increments[t] is the delayed Right update of trace t-stride,
-    delivered after observing that trace's right context. Fresh tokens stay
-    on the local path and never directly enter this persistent recurrence.
+    The current write is applied immediately. With stride = write_window + 1,
+    the inherited phase is just before the current write's attention window.
     ``initial`` holds theta[-stride:0] in chronological order. Reshaping into
-    stride-wide rows gives independent prefix sums down each trace path.
-    The returned tail is ready for a continuation of any (unaligned) length.
+    stride-wide rows gives independent prefix sums along each phase lane.
+    The returned tail supports continuation at arbitrary chunk boundaries.
     """
     batch, length, width = increments.shape
     if length == 0 or stride < 1:
@@ -46,8 +45,7 @@ def phase_stride_scan(increments, stride, initial=None):
         raise ValueError("initial must have shape (batch, stride, hidden_size)")
     # FP64 preserves low-order phase bits in long scans; MPS has no FP64.
     accumulation_dtype = torch.float32 if increments.device.type == "mps" else torch.float64
-    pad = (-length) % stride
-    rows = F.pad(increments.to(accumulation_dtype), (0, 0, 0, pad))
+    rows = F.pad(increments.to(accumulation_dtype), (0, 0, 0, (-length) % stride))
     rows = rows.reshape(batch, -1, stride, width)
     phases = wrap_phase(rows.cumsum(dim=1) + initial.to(accumulation_dtype).unsqueeze(1))
     phases = phases.reshape(batch, -1, width)[:, :length]
@@ -55,23 +53,22 @@ def phase_stride_scan(increments, stride, initial=None):
     return phases, tail
 
 
-def phase_validity_stride_scan(right_valid, stride, initial=None):
-    """Solve valid[t] = valid[t-stride] OR right_valid[t].
+def phase_validity_stride_scan(write_valid, stride, initial=None):
+    """Solve valid[t] = valid[t-stride] OR write_valid[t].
 
     Validity follows physical positions even through padding, just like phase
-    carry. A masked raw position cannot initialize a lane; a valid zero-angle Right update
-    can. The chronological tail supports chunks shorter than the stride.
+    carry. A masked position cannot initialize memory; a valid zero-angle write can.
     """
-    batch, length = right_valid.shape
+    batch, length = write_valid.shape
     if length == 0 or stride < 1:
         raise ValueError("phase_validity_stride_scan requires a nonempty sequence and positive stride")
     if initial is None:
-        initial = right_valid.new_zeros(batch, stride)
-    if right_valid.dtype != torch.bool or initial.dtype != torch.bool:
+        initial = write_valid.new_zeros(batch, stride)
+    if write_valid.dtype != torch.bool or initial.dtype != torch.bool:
         raise ValueError("Phase validity must be boolean")
     if initial.shape != (batch, stride):
         raise ValueError("initial validity must have shape (batch, stride)")
-    rows = F.pad(right_valid, (0, (-length) % stride)).reshape(batch, -1, stride)
+    rows = F.pad(write_valid, (0, (-length) % stride)).reshape(batch, -1, stride)
     valid = (rows.cumsum(dim=1, dtype=torch.int32) > 0) | initial[:, None]
     valid = valid.reshape(batch, -1)[:, :length]
     tail = torch.cat((initial, valid), dim=1)[:, -stride:]
@@ -90,28 +87,29 @@ class RMSNorm(nn.Module):
 
 
 class LocalAttention(nn.Module):
-    """Local eager attention or native FlashAttention-2 sliding windows."""
+    """Causal local attention over the current token and preceding window."""
 
-    def __init__(self, hidden_size, heads, left, right, dropout, config=None):
+    def __init__(self, hidden_size, heads, window, dropout, config=None, qk_head_dim=None):
         super().__init__()
         self.config = config
         self.heads, self.head_dim = heads, hidden_size // heads
-        self.left, self.right, self.dropout = left, right, dropout
-        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.qk_head_dim = self.head_dim if qk_head_dim is None else qk_head_dim
+        self.window, self.dropout = window, dropout
+        self.q_proj = nn.Linear(hidden_size, heads * self.qk_head_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, heads * self.qk_head_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.position_encoding = "relative_bias" if config is None else config.position_encoding
         self.rope_theta = 10_000.0 if config is None else config.rope_theta
         if self.position_encoding == "relative_bias":
-            self.relative_bias = nn.Parameter(torch.zeros(heads, left + right + 1))
+            self.relative_bias = nn.Parameter(torch.zeros(heads, window + 1))
         else:
             self.register_parameter("relative_bias", None)
 
     def _rotate(self, tensor, positions):
         # Compute frequencies at FP32 even when the model itself is FP16/BF16.
         frequencies = self.rope_theta ** (
-            -torch.arange(0, self.head_dim, 2, device=tensor.device, dtype=torch.float32) / self.head_dim
+            -torch.arange(0, self.qk_head_dim, 2, device=tensor.device, dtype=torch.float32) / self.qk_head_dim
         )
         angles = positions.float()[:, None] * frequencies[None]
         cos, sin = angles.cos()[None, :, None], angles.sin()[None, :, None]
@@ -120,8 +118,8 @@ class LocalAttention(nn.Module):
 
     def forward(self, query, source, centers, source_start, source_mask, query_mask):
         batch, length, _ = query.shape
-        q = self.q_proj(query).reshape(batch, length, self.heads, self.head_dim)
-        k = self.k_proj(source).reshape(batch, -1, self.heads, self.head_dim)
+        q = self.q_proj(query).reshape(batch, length, self.heads, self.qk_head_dim)
+        k = self.k_proj(source).reshape(batch, -1, self.heads, self.qk_head_dim)
         v = self.v_proj(source).reshape(batch, -1, self.heads, self.head_dim)
         if self.position_encoding == "rope":
             q = self._rotate(q, centers)
@@ -135,19 +133,19 @@ class LocalAttention(nn.Module):
                 raise ValueError("FlashAttention-2 requires CUDA Q/K/V in float16 or bfloat16; use model.to() or autocast")
             result = _flash_local_attention(
                 q, k, v, centers, source_start, source_mask, query_mask,
-                self.left, self.right, self.dropout if self.training else 0.0,
+                self.window, self.dropout if self.training else 0.0,
                 _load_flash_attention(),
             )
             return self.o_proj(result.reshape(batch, length, -1))
         if backend not in (None, "eager"):
             raise ValueError(f"Unsupported attention backend: {backend}")
-        offsets = torch.arange(-self.left, self.right + 1, device=query.device)
+        offsets = torch.arange(-self.window, 1, device=query.device)
         indices = centers[:, None] + offsets[None, :] - source_start
         in_bounds = (indices >= 0) & (indices < source.shape[1])
         indices = indices.clamp(0, source.shape[1] - 1)
         allowed = in_bounds[None] & source_mask[:, indices] & query_mask[:, :, None]
         k, v = k[:, indices], v[:, indices]
-        scores = torch.einsum("bqhd,bqwhd->bqhw", q.float(), k.float()) / math.sqrt(self.head_dim)
+        scores = torch.einsum("bqhd,bqwhd->bqhw", q.float(), k.float()) / math.sqrt(self.qk_head_dim)
         if self.relative_bias is not None:
             scores = scores + self.relative_bias.float()[None, None]
         scores = scores.masked_fill(~allowed[:, :, None], torch.finfo(scores.dtype).min)
@@ -179,21 +177,25 @@ def _contiguous_mask_bounds(mask):
     return torch.stack((start, end), -1).tolist()
 
 
-def _flash_local_attention(q, k, v, centers, source_start, source_mask, query_mask, left, right, dropout, kernel):
+def _flash_local_attention(q, k, v, centers, source_start, source_mask, query_mask, window, dropout, kernel):
     """Pack native local windows without expanding K/V or adding dummy queries.
 
-    FA2 aligns unequal Q/K lengths at the bottom right. For a row ending s keys
-    after its last real query center, shift the kernel window to (left+s,
-    right-s). RoPE still uses the original physical centers. Group rows by s
-    because the native window is shared by all sequences in one kernel call.
+    FA2 aligns unequal Q/K lengths at the bottom right. Trim each row's keys
+    to end at its last real query center, then use the causal window (window, 0).
+    RoPE still uses the original physical centers.
     The kernel parameter permits a dense oracle to test packing on CPU.
     """
+    softmax_scale = q.shape[-1] ** -0.5
+    # FA2 requires equal Q/K/V widths. Pad after RoPE and keep the Q/K scale.
+    padding = v.shape[-1] - q.shape[-1]
+    if padding:
+        q, k = F.pad(q, (0, padding)), F.pad(k, (0, padding))
     if not torch.equal(centers, centers[0] + torch.arange(q.shape[1], device=q.device)):
         raise ValueError("FlashAttention query centers must be consecutive physical positions")
     center_start = int(centers[0])
     key_bounds = _contiguous_mask_bounds(source_mask)
     query_bounds = _contiguous_mask_bounds(query_mask)
-    groups = {}
+    spans = []
     for batch, ((k0, k1), (q0, q1)) in enumerate(zip(key_bounds, query_bounds)):
         if q0 == q1 or k0 == k1:
             continue
@@ -201,14 +203,12 @@ def _flash_local_attention(q, k, v, centers, source_start, source_mask, query_ma
         last_center = center_start + q1 - 1 - source_start
         if first_center < k0 or last_center >= k1:
             raise ValueError("Unmasked query centers must refer to unmasked source positions")
-        k0 = max(k0, first_center - left)
-        k1 = min(k1, last_center + right + 1)
-        alignment_shift = k1 - last_center - 1
-        groups.setdefault(alignment_shift, []).append((batch, q0, q1, k0, k1))
-    # Keep zero gradients to all projections even for an all-padding batch or
-    # a Right-attention call before any trace has reached its delivery time.
+        k0 = max(k0, first_center - window)
+        k1 = last_center + 1
+        spans.append((batch, q0, q1, k0, k1))
+    # Keep zero gradients to all projections even for an all-padding batch.
     result = q * 0 + (k.float().sum() * 0 + v.float().sum() * 0).to(q.dtype)
-    for shift, spans in groups.items():
+    if spans:
         queries, keys, values = [], [], []
         cu_q, cu_k = [0], [0]
         for batch, q0, q1, k0, k1 in spans:
@@ -223,8 +223,8 @@ def _flash_local_attention(q, k, v, centers, source_start, source_mask, query_ma
             cu_seqlens_k=torch.tensor(cu_k, dtype=torch.int32, device=q.device),
             max_seqlen_q=max(b - a for a, b in zip(cu_q, cu_q[1:])),
             max_seqlen_k=max(b - a for a, b in zip(cu_k, cu_k[1:])),
-            dropout_p=dropout, softmax_scale=q.shape[-1] ** -0.5,
-            causal=right == shift, window_size=(left + shift, right - shift),
+            dropout_p=dropout, softmax_scale=softmax_scale,
+            causal=True, window_size=(window, 0),
         )
         for (batch, q0, q1, _, _), packed_start in zip(spans, cu_q):
             result[batch, q0:q1] = packed[packed_start:packed_start + q1 - q0]
@@ -239,10 +239,14 @@ class TraceRelayLayerState:
     mask: torch.Tensor
     phases: torch.Tensor
     phase_valid: torch.Tensor
+    # Uncorrected FP32 increments have their own window, independent of reads
+    # and writes. None means this layer has no delta attention module.
+    raw_delta: torch.Tensor | None = None
+    delta_mask: torch.Tensor | None = None
 
 
 class TraceRelayCache(Cache):
-    """Bounded local buffers, last W persistent phases and lane validity.
+    """Bounded local buffers and the last write_window + 1 phases per layer.
 
     This mutable cache belongs to one sequence batch.
     Call detach() for truncated backpropagation.
@@ -256,12 +260,13 @@ class TraceRelayCache(Cache):
 
     @staticmethod
     def config_signature(config):
-        return (config.layer_order, config.hidden_size, config.num_attention_heads, config.position_encoding, config.rope_theta,
-                tuple(config.layer_hidden_sizes), tuple(config.layer_intermediate_sizes),
-                tuple(config.layer_num_attention_heads),
-                tuple(tuple(pair) for pair in config.skip_pairs), config.recurrent_carry, config.relay_enabled,
+        return (config.hidden_size, config.intermediate_size, config.num_hidden_layers,
+                config.num_attention_heads, config.position_encoding, config.rope_theta,
+                config.phase_update_scale, config.rms_norm_eps, config.recurrent_carry, config.relay_enabled,
+                config.phase_correction_scale, config.delta_detach_inputs,
                 *(tuple(getattr(config, name)) for name in (
-            "left_window", "right_window", "relay_stride"
+            "read_window", "write_window", "read_qk_head_dim", "write_qk_head_dim",
+            "delta_window", "delta_qk_head_dim",
         )))
 
     @property
@@ -285,9 +290,10 @@ class TraceRelayCache(Cache):
     def reorder_cache(self, beam_idx):
         for state in self.states:
             if state is not None:
-                for name in ("raw_hidden", "memory_hidden", "mask", "phases", "phase_valid"):
-                    tensor = getattr(state, name)
-                    setattr(state, name, tensor.index_select(0, beam_idx.to(tensor.device)))
+                for field in fields(state):
+                    tensor = getattr(state, field.name)
+                    if tensor is not None:
+                        setattr(state, field.name, tensor.index_select(0, beam_idx.to(tensor.device)))
 
     def batch_select_indices(self, indices):
         self.reorder_cache(indices)
@@ -295,14 +301,18 @@ class TraceRelayCache(Cache):
     def batch_repeat_interleave(self, repeats):
         for state in self.states:
             if state is not None:
-                for name in ("raw_hidden", "memory_hidden", "mask", "phases", "phase_valid"):
-                    setattr(state, name, getattr(state, name).repeat_interleave(repeats, dim=0))
+                for field in fields(state):
+                    tensor = getattr(state, field.name)
+                    if tensor is not None:
+                        setattr(state, field.name, tensor.repeat_interleave(repeats, dim=0))
 
     def detach(self):
         for state in self.states:
             if state is not None:
-                for name in ("raw_hidden", "memory_hidden", "mask", "phases", "phase_valid"):
-                    setattr(state, name, getattr(state, name).detach())
+                for field in fields(state):
+                    tensor = getattr(state, field.name)
+                    if tensor is not None:
+                        setattr(state, field.name, tensor.detach())
         return self
 
     def reset(self):
@@ -316,40 +326,52 @@ class TraceRelayCache(Cache):
 class TraceRelayLayer(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        h = config.layer_hidden_sizes[layer_idx]
-        heads = config.layer_num_attention_heads[layer_idx]
+        h = config.hidden_size
+        heads = config.num_attention_heads
+        self.config = config
         self.relay_enabled = config.relay_enabled
         self.recurrent_carry = config.recurrent_carry
-        self.stride = config.relay_stride[layer_idx]
-        self.history_size = max(config.left_window[layer_idx], self.stride if self.relay_enabled else 0)
+        self.stride = config.write_window[layer_idx] + 1
+        self.history_size = max(config.read_window[layer_idx],
+                                config.write_window[layer_idx] if self.relay_enabled else 0)
         self.scale = config.phase_update_scale
         if self.relay_enabled:
-            self.input_norm = RMSNorm(h, config.rms_norm_eps)
-        self.left_input_norm = RMSNorm(h, config.rms_norm_eps)
-        self.left_attention = LocalAttention(
+            self.write_input_norm = RMSNorm(h, config.rms_norm_eps)
+        self.read_input_norm = RMSNorm(h, config.rms_norm_eps)
+        self.read_attention = LocalAttention(
             h, heads,
-            config.left_window[layer_idx], 0, config.attention_dropout, config=config,
+            config.read_window[layer_idx], config.attention_dropout, config=config,
+            qk_head_dim=config.read_qk_head_dim[layer_idx],
         )
         if self.relay_enabled:
-            self.right_attention = LocalAttention(
+            self.write_attention = LocalAttention(
                 h, heads,
-                0, config.right_window[layer_idx], config.attention_dropout, config=config,
+                config.write_window[layer_idx], config.attention_dropout, config=config,
+                qk_head_dim=config.write_qk_head_dim[layer_idx],
             )
-            self.right_phase = nn.Linear(h, h, bias=False)
-        self.left_output = nn.Linear(h, h, bias=False)
+            self.write_phase = nn.Linear(h, h, bias=False)
+        self.read_output = nn.Linear(h, h, bias=False)
         if self.relay_enabled:
             self.phase_output = nn.Linear(2 * h, h, bias=False)
         self.post_norm = RMSNorm(h, config.rms_norm_eps)
-        ff = config.layer_intermediate_sizes[layer_idx]
+        ff = config.intermediate_size
         self.gate_proj = nn.Linear(h, ff, bias=False)
         self.up_proj = nn.Linear(h, ff, bias=False)
         self.down_proj = nn.Linear(ff, h, bias=False)
         self.dropout = nn.Dropout(config.hidden_dropout)
+        # Construct last so the existing layer initialization order is retained
+        # when correction is disabled (including old checkpoints).
+        self.delta_attention = (
+            LocalAttention(h, heads, config.delta_window[layer_idx],
+                           config.attention_dropout, config=config,
+                           qk_head_dim=config.delta_qk_head_dim[layer_idx])
+            if self.relay_enabled and config.delta_window[layer_idx] > 0 else None
+        )
 
     def forward(self, hidden, mask, offset, state=None):
         if not self.relay_enabled:
             return self._forward_swa(hidden, mask, offset, state)
-        raw = self.input_norm(hidden)
+        raw = self.write_input_norm(hidden)
         if state is None:
             raw_source, source_mask = raw, mask
             old_length = 0
@@ -360,78 +382,94 @@ class TraceRelayLayer(nn.Module):
         source_start = offset - old_length
         positions = torch.arange(offset, offset + hidden.shape[1], device=hidden.device)
 
-        # Compute the Right update directly at its arrival time. A center i=t-W reads
-        # only i through i+right < t, so the right-looking operation is causal.
-        # Q/K/V all use the raw lower-layer representation, independent of
-        # this layer's recurrent state and Left attention. Queries stay parallel.
-        centers = positions - self.stride
-        indices = centers - source_start
-        valid_centers = (indices >= 0) & (indices < raw_source.shape[1])
-        indices = indices.clamp(0, raw_source.shape[1] - 1)
-        right_mask = valid_centers[None] & source_mask[:, indices]
-        old_raw = raw_source[:, indices]
-        right = self.right_attention(old_raw, raw_source, centers, source_start, source_mask, right_mask)
-        right_delta = self.scale * self.right_phase(right).float().tanh()
-        right_delta = right_delta * right_mask[:, :, None]
+        # Write at t attends [t-write_window, t] and enters phase[t] immediately.
+        # Q/K/V use lower-layer inputs, independent of this layer's phase/read path.
+        write = self.write_attention(raw, raw_source, positions, source_start, source_mask, mask)
+        write_delta = self.scale * self.write_phase(write).float().tanh()
+        write_delta = write_delta * mask[:, :, None]
+        delta_tail = delta_mask_tail = None
+        if self.delta_attention is not None:
+            # Attend only raw writes: corrected deltas never become attention
+            # sources. This preserves parallel computation and direct gradients
+            # into earlier write operations, including across cached chunks.
+            delta_source = (write_delta if state is None else
+                            torch.cat((state.raw_delta, write_delta), dim=1))
+            delta_mask = mask if state is None else torch.cat((state.delta_mask, mask), dim=1)
+            delta_start = offset + hidden.shape[1] - delta_source.shape[1]
+            # Stop only the auxiliary input-gradient route. The uncorrected
+            # write still enters the carry, and the attention weights train.
+            delta_query = write_delta.detach() if self.config.delta_detach_inputs else write_delta
+            attention_source = delta_source.detach() if self.config.delta_detach_inputs else delta_source
+            correction = self.delta_attention(
+                delta_query.to(hidden.dtype), attention_source.to(hidden.dtype),
+                positions, delta_start, delta_mask, mask,
+            )
+            write_delta = write_delta + (
+                self.config.phase_correction_scale * correction.float().tanh() * mask[:, :, None]
+            )
+            delta_tail = delta_source[:, -self.delta_attention.window:].clone()
+            delta_mask_tail = delta_mask[:, -self.delta_attention.window:].clone()
         if self.recurrent_carry:
             phases, tail = phase_stride_scan(
-                right_delta, self.stride, None if state is None else state.phases,
+                write_delta, self.stride, None if state is None else state.phases,
             )
             phase_valid, valid_tail = phase_validity_stride_scan(
-                right_mask, self.stride, None if state is None else state.phase_valid,
+                mask, self.stride, None if state is None else state.phase_valid,
             )
         else:
-            # Ablate the forward carry itself, keeping delayed writes and every
-            # local/gradient path. Tails are diagnostics only in this mode.
-            phases, phase_valid = wrap_phase(right_delta), right_mask
-            previous = (right_delta.new_zeros(right_delta.shape[0], self.stride, right_delta.shape[-1])
+            # Keep immediate writes and local paths while ablating phase carry.
+            phases, phase_valid = wrap_phase(write_delta), mask
+            previous = (write_delta.new_zeros(hidden.shape[0], self.stride, hidden.shape[-1])
                         if state is None else state.phases)
-            previous_valid = (right_mask.new_zeros(right_delta.shape[0], self.stride)
+            previous_valid = (mask.new_zeros(hidden.shape[0], self.stride)
                               if state is None else state.phase_valid)
             tail = torch.cat((previous, phases), dim=1)[:, -self.stride:]
             valid_tail = torch.cat((previous_valid, phase_valid), dim=1)[:, -self.stride:]
         features = torch.cat((phases.cos(), phases.sin()), dim=-1).to(hidden.dtype)
         features = features * phase_valid[:, :, None]
-        # Expose the persistent readout before Left attention forms any Q/K/V.
-        # phase_output has no bias, so invalid lanes contribute exactly zero.
+        # Expose the current write and accumulated phase before read Q/K/V.
+        # phase_output has no bias, so uninitialized memory contributes zero.
         memory_hidden = hidden + self.dropout(self.phase_output(features))
-        memory_for_attention = self.left_input_norm(memory_hidden)
-        left_source = (memory_for_attention if state is None else
+        memory_for_attention = self.read_input_norm(memory_hidden)
+        read_source = (memory_for_attention if state is None else
                        torch.cat((state.memory_hidden, memory_for_attention), dim=1))
-        left = self.left_attention(memory_for_attention, left_source, positions, source_start, source_mask, mask)
-        hidden = memory_hidden + self.dropout(self.left_output(left))
+        read = self.read_attention(memory_for_attention, read_source, positions, source_start, source_mask, mask)
+        hidden = memory_hidden + self.dropout(self.read_output(read))
         normalized = self.post_norm(hidden)
         hidden = hidden + self.dropout(self.down_proj(F.silu(self.gate_proj(normalized)) * self.up_proj(normalized)))
         hidden = hidden * mask[:, :, None]
         # clone() prevents a small cached view from retaining an entire prefill
         # allocation under no_grad. Graphs remain intact during training.
+        start = raw_source.shape[1] - min(self.history_size, raw_source.shape[1])
         next_state = TraceRelayLayerState(
-            raw_source[:, -self.history_size:].clone(),
-            left_source[:, -self.history_size:].clone(),
-            source_mask[:, -self.history_size:].clone(),
+            raw_source[:, start:].clone(),
+            read_source[:, start:].clone(),
+            source_mask[:, start:].clone(),
             tail.clone(),
             valid_tail.clone(),
+            delta_tail,
+            delta_mask_tail,
         )
         return hidden, next_state
 
     def _forward_swa(self, hidden, mask, offset, state):
-        """The same Left/FFN path, without Right modules or phase storage."""
-        memory_for_attention = self.left_input_norm(hidden)
+        """The same read/FFN path, without write modules or phase storage."""
+        memory_for_attention = self.read_input_norm(hidden)
         old_length = 0 if state is None else state.memory_hidden.shape[1]
-        left_source = (memory_for_attention if state is None else
+        read_source = (memory_for_attention if state is None else
                        torch.cat((state.memory_hidden, memory_for_attention), dim=1))
         source_mask = mask if state is None else torch.cat((state.mask, mask), dim=1)
         positions = torch.arange(offset, offset + hidden.shape[1], device=hidden.device)
-        left = self.left_attention(memory_for_attention, left_source, positions, offset - old_length, source_mask, mask)
-        hidden = hidden + self.dropout(self.left_output(left))
+        read = self.read_attention(memory_for_attention, read_source, positions, offset - old_length, source_mask, mask)
+        hidden = hidden + self.dropout(self.read_output(read))
         normalized = self.post_norm(hidden)
         hidden = hidden + self.dropout(self.down_proj(F.silu(self.gate_proj(normalized)) * self.up_proj(normalized)))
         hidden = hidden * mask[:, :, None]
         # Explicit start indexing handles L=0; ``[-0:]`` would keep everything.
-        start = left_source.shape[1] - min(self.history_size, left_source.shape[1])
+        start = read_source.shape[1] - min(self.history_size, read_source.shape[1])
         next_state = TraceRelayLayerState(
             hidden[:, :0].clone(),
-            left_source[:, start:].clone(),
+            read_source[:, start:].clone(),
             source_mask[:, start:].clone(),
             hidden.new_empty(hidden.shape[0], 0, hidden.shape[-1],
                              dtype=torch.float32),
@@ -463,7 +501,7 @@ class TraceRelayPreTrainedModel(PreTrainedModel):
             raise ValueError("TraceRelay supports attn_implementation='eager' or 'flash_attention_2'")
         if self.config.position_encoding != "rope":
             raise ValueError("FlashAttention requires a RoPE checkpoint; relative_bias checkpoints must use eager")
-        if any(h // heads > 256 for h, heads in zip(self.config.layer_hidden_sizes, self.config.layer_num_attention_heads)):
+        if self.config.v_head_dim > 256:
             raise ValueError("FlashAttention-2 requires a per-head hidden dimension <= 256")
         self._flash_attn_can_dispatch(2, is_init_check=is_init_check)
         _load_flash_attention()
@@ -486,25 +524,6 @@ class TraceRelayModel(TraceRelayPreTrainedModel):
         super().__init__(config)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, config.pad_token_id)
         self.layers = nn.ModuleList([TraceRelayLayer(config, i) for i in range(config.num_hidden_layers)])
-        layer_inputs = [config.hidden_size, *config.layer_hidden_sizes[:-1]]
-        self.layer_input_projections = nn.ModuleList([
-            nn.Identity() if src == dst else nn.Linear(src, dst, bias=False)
-            for src, dst in zip(layer_inputs, config.layer_hidden_sizes)
-        ])
-        self.skip_sources = {source for source, _ in config.skip_pairs}
-        self.skip_destinations = {}
-        for source, destination in config.skip_pairs:
-            self.skip_destinations.setdefault(destination, []).append(source)
-        self.skip_projections = nn.ModuleDict({
-            f"{src}_{dst}": (
-                nn.Identity() if config.layer_hidden_sizes[src] == config.layer_hidden_sizes[dst]
-                else nn.Linear(config.layer_hidden_sizes[src], config.layer_hidden_sizes[dst], bias=False)
-            ) for src, dst in config.skip_pairs
-        })
-        self.output_projection = (
-            nn.Identity() if config.layer_hidden_sizes[-1] == config.hidden_size
-            else nn.Linear(config.layer_hidden_sizes[-1], config.hidden_size, bias=False)
-        )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_init()
 
@@ -563,20 +582,11 @@ class TraceRelayModel(TraceRelayPreTrainedModel):
         hidden = hidden * mask[:, :, None]
         history = () if output_hidden_states else None
         next_states = []
-        skip_outputs = {}
         for index, layer in enumerate(self.layers):
-            hidden = self.layer_input_projections[index](hidden)
-            # These tensors all describe this call's identical physical token
-            # positions; skips never move information along the time axis.
-            for source in self.skip_destinations.get(index, ()):
-                hidden = hidden + self.skip_projections[f"{source}_{index}"](skip_outputs[source])
             if output_hidden_states:
                 history += (hidden,)
             hidden, state = layer(hidden, mask, offset, None if cache is None else cache.states[index])
-            if index in self.skip_sources:
-                skip_outputs[index] = hidden
             next_states.append(state)
-        hidden = self.output_projection(hidden)
         hidden = self.norm(hidden) * mask[:, :, None]
         if output_hidden_states:
             history += (hidden,)
